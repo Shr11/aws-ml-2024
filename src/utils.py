@@ -29,11 +29,18 @@ def ocr_init(gpu=True):
     reader = easyocr.Reader(['en'], gpu=gpu)
     return reader
  
-
+# clean text
+def clean_text(text):
+    """improving formatting of the extracted text"""
+    # Removing special characters and standardizing common patterns
+    text = re.sum(r'[^0-9a-zA-Z\s.,]+', '', text)  # Remove special characters
+    text = text.replace("lbs", " lb").replace("in", " in").replace("cm"," cm") # standardize units
+    return text
  
  # extract text from image   
 def ocr_extract_and_parse_text(reader,image_folder, df , limit_rows=140000):
     text_data = {}
+    
     for idx, img_path in enumerate(Path(image_folder).glob("*.jpg")):
         if idx >= limit_rows:
             break
@@ -43,8 +50,11 @@ def ocr_extract_and_parse_text(reader,image_folder, df , limit_rows=140000):
             result = reader.readtext(str(img_path), detail=0, paragraph=True)
             text = ' '.join(result).strip() if result else ""
             
+            # clean the text to try to fix invalid errors
+            cleaned_text = clean_text(text)
+            
             # parse the extracted text
-            parsed_value, parsed_unit = parse_string(text)
+            parsed_value, parsed_unit = parse_string(cleaned_text)
             
             # store the result by image_id
             text_data[img_path.stem] = (parsed_value, parsed_unit)  
@@ -85,9 +95,11 @@ def common_mistake(unit):
     return unit
 
 def parse_string(s):
-    s_stripped = "" if s==None or str(s)=='nan' else s.strip()
+    s_stripped = "" if s is None or str(s).lower() =='nan' else s.strip()
+   
     if s_stripped == "":
         return None, None
+    
     pattern = re.compile(r'^-?\d+(\.\d+)?\s+[a-zA-Z\s]+$')
     if not pattern.match(s_stripped):
         raise ValueError("Invalid format in {}".format(s))
