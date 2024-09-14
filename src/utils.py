@@ -13,6 +13,9 @@ from functools import partial
 import requests
 import urllib
 from PIL import Image
+import pandas as pd
+import numpy as np
+
 
 def common_mistake(unit):
     if unit in constants.allowed_units:
@@ -81,3 +84,12 @@ def download_images(image_links, download_folder, allow_multiprocessing=True):
         for image_link in tqdm(image_links, total=len(image_links)):
             download_image(image_link, save_folder=download_folder, retries=3, delay=3)
         
+        
+def main():
+    
+    df = pd.read_csv('D:\Desktop_Ddrive\aws_ml\dataset\train.csv')
+    
+    array = df.iloc[70000:140000]['image_link'].to_numpy()
+    
+    array = [(c,i) for i,c in enumerate(array)]
+    
