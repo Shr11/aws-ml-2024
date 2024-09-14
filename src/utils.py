@@ -76,7 +76,7 @@ def download_images(image_links, download_folder, allow_multiprocessing=True):
         download_image_partial = partial(
             download_image, save_folder=download_folder, retries=3, delay=3)
 
-        with multiprocessing.Pool(64) as pool:
+        with multiprocessing.Pool(50) as pool:
             list(tqdm(pool.imap(download_image_partial, image_links), total=len(image_links)))
             pool.close()
             pool.join()
@@ -86,10 +86,17 @@ def download_images(image_links, download_folder, allow_multiprocessing=True):
         
         
 def main():
+    # creating array
+    df = pd.read_csv('D:/Desktop_Ddrive/aws_ml/dataset/train.csv')
     
-    df = pd.read_csv('D:\Desktop_Ddrive\aws_ml\dataset\train.csv')
+    array = df.iloc[:140000]['image_link'].to_numpy()
     
-    array = df.iloc[70000:140000]['image_link'].to_numpy()
+    save_folder = "./images"
     
-    array = [(c,i) for i,c in enumerate(array)]
+    # downloading images
+    download_images(array,save_folder)
     
+    
+    
+if __name__ == '__main__':
+    main()
