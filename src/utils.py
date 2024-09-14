@@ -15,15 +15,73 @@ import urllib
 from PIL import Image
 import pandas as pd
 import numpy as np
+import torch
+from pathlib import Path
+import easyocr
+import cv2
 
+# gpu
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")   
 
+# initialize the ocr reader
+def ocr_init(gpu=True):
+    print("Initializing OCR")
+    reader = easyocr.Reader(['en'], gpu=gpu)
+    return reader
+ 
+
+ 
+ # extract text from image   
+def ocr_extract_and_parse_text(reader,image_folder, df , limit_rows=140000):
+    text_data = {}
+    for idx, img_path in enumerate(Path(image_folder).glob("*.jpg")):
+        if idx >= limit_rows:
+            break
+        
+        try:
+            # extract text from image
+            result = reader.readtext(str(img_path), detail=0, paragraph=True)
+            text = ' '.join(result).strip() if result else ""
+            
+            # parse the extracted text
+            parsed_value, parsed_unit = parse_string(text)
+            
+            # store the result by image_id
+            text_data[img_path.stem] = (parsed_value, parsed_unit)  
+            
+        except ValueError as e:
+            print(f"Error processing {img_path}: {e}")
+            text_data[img_path.stem] = (None, None)
+            
+    ocr_df = pd.DataFrame.from_dict(text_data , orient='index', columns=['value', 'unit'])
+        
+    return ocr_df
+    
 def common_mistake(unit):
+    # lower case and no trailing spaces
+    unit = unit.lower().strip()
+    
+    corrections = {
+        'grams': 'gram',
+        'kilograms': 'kilogram',
+        'ounces': 'ounce',
+        'centimetres': 'centimetre',
+        'inches': 'inch',
+        # Add more corrections here
+    }
+    
+    if unit in corrections:
+        return corrections.get(unit,unit)
+    
     if unit in constants.allowed_units:
         return unit
+    
     if unit.replace('ter', 'tre') in constants.allowed_units:
         return unit.replace('ter', 'tre')
+    
     if unit.replace('feet', 'foot') in constants.allowed_units:
         return unit.replace('feet', 'foot')
+    
     return unit
 
 def parse_string(s):
@@ -89,14 +147,23 @@ def main():
     # creating array
     df = pd.read_csv('D:/Desktop_Ddrive/aws_ml/dataset/train.csv')
     
-    array = df.iloc[:140000]['image_link'].to_numpy()
+    # array = df.iloc[:140000]['image_link'].to_numpy()
     
-    save_folder = "./images"
+    # save_folder = "./images"
     
-    # downloading images
-    download_images(array,save_folder)
+    # # downloading images
+    # download_images(array,save_folder)
     
+    reader  =  ocr_init(gpu=True)
     
+    # # extract and parse text from image
+    img_folder = "D:/Desktop_Ddrive/aws_ml/resized_images"
+    ocr_df = ocr_extract_and_parse_text(reader,img_folder, df , limit_rows=140000)
+    
+    # Merge the OCR data with the input DataFrame, using the image_id to match
+    df['parsed_value'], df['parsed_unit'] = zip(*df['image_id'].map(ocr_df.to_dict('index')).apply(lambda x: (x['parsed_value'], x['parsed_unit']) if x else (None, None)))
+
+    print(df.head())
     
 if __name__ == '__main__':
     main()
