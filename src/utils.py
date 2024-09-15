@@ -1,181 +1,216 @@
-import re
-import constants
 import os
-import requests
-import pandas as pd
-import multiprocessing
+import re
 import time
-from time import time as timer
-from tqdm import tqdm
+import cv2
+import torch
+import requests
 import numpy as np
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
 from pathlib import Path
 from functools import partial
-import requests
-import urllib
-from PIL import Image
-import pandas as pd
-import numpy as np
-import torch
-from pathlib import Path
-import easyocr
-import cv2
+from sklearn.model_selection import train_test_split
+from concurrent.futures import ThreadPoolExecutor
+import xgboost as xgb
+import pytesseract
+import multiprocessing
+from io import BytesIO
 
-# gpu
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")   
+# ---------------------- Image Preprocessing Functions ----------------------
 
-# initialize the ocr reader
-def ocr_init(gpu=True):
-    print("Initializing OCR")
-    reader = easyocr.Reader(['en'], gpu=gpu)
-    return reader
- 
-# clean text
-def clean_text(text):
-    """improving formatting of the extracted text"""
-    # Removing special characters and standardizing common patterns
-    text = re.sum(r'[^0-9a-zA-Z\s.,]+', '', text)  # Remove special characters
-    text = text.replace("lbs", " lb").replace("in", " in").replace("cm"," cm") # standardize units
-    return text
- 
- # extract text from image   
-def ocr_extract_and_parse_text(reader,image_folder, df , limit_rows=140000):
-    text_data = {}
-    
-    for idx, img_path in enumerate(Path(image_folder).glob("*.jpg")):
-        if idx >= limit_rows:
-            break
-        
-        try:
-            # extract text from image
-            result = reader.readtext(str(img_path), detail=0, paragraph=True)
-            text = ' '.join(result).strip() if result else ""
-            
-            # clean the text to try to fix invalid errors
-            cleaned_text = clean_text(text)
-            
-            # parse the extracted text
-            parsed_value, parsed_unit = parse_string(cleaned_text)
-            
-            # store the result by image_id
-            text_data[img_path.stem] = (parsed_value, parsed_unit)  
-            
-        except ValueError as e:
-            print(f"Error processing {img_path}: {e}")
-            text_data[img_path.stem] = (None, None)
-            
-    ocr_df = pd.DataFrame.from_dict(text_data , orient='index', columns=['value', 'unit'])
-        
-    return ocr_df
-    
-def common_mistake(unit):
-    # lower case and no trailing spaces
-    unit = unit.lower().strip()
-    
-    corrections = {
-        'grams': 'gram',
-        'kilograms': 'kilogram',
-        'ounces': 'ounce',
-        'centimetres': 'centimetre',
-        'inches': 'inch',
-        # Add more corrections here
-    }
-    
-    if unit in corrections:
-        return corrections.get(unit,unit)
-    
-    if unit in constants.allowed_units:
-        return unit
-    
-    if unit.replace('ter', 'tre') in constants.allowed_units:
-        return unit.replace('ter', 'tre')
-    
-    if unit.replace('feet', 'foot') in constants.allowed_units:
-        return unit.replace('feet', 'foot')
-    
-    return unit
+def rescale_image(image, scale_percent=150):
+    """Rescale input image by the specified percentage."""
+    width = int(image.shape[1] * scale_percent / 100)
+    height = int(image.shape[0] * scale_percent / 100)
+    dim = (width, height)
+    return cv2.resize(image, dim, interpolation=cv2.INTER_LINEAR)
 
-def parse_string(s):
-    s_stripped = "" if s is None or str(s).lower() =='nan' else s.strip()
-   
-    if s_stripped == "":
-        return None, None
-    
-    pattern = re.compile(r'^-?\d+(\.\d+)?\s+[a-zA-Z\s]+$')
-    if not pattern.match(s_stripped):
-        raise ValueError("Invalid format in {}".format(s))
-    parts = s_stripped.split(maxsplit=1)
-    number = float(parts[0])
-    unit = common_mistake(parts[1])
-    if unit not in constants.allowed_units:
-        raise ValueError("Invalid unit [{}] found in {}. Allowed units: {}".format(
-            unit, s, constants.allowed_units))
-    return number, unit
+def enhance_contrast(image):
+    """Enhance image contrast using histogram equalization."""
+    img_yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+    img_yuv[:, :, 0] = cv2.equalizeHist(img_yuv[:, :, 0])
+    return cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
 
+def binarize_image(image):
+    """Convert image to binary format using adaptive thresholding."""
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return cv2.adaptiveThreshold(gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
 
-def create_placeholder_image(image_save_path):
+def remove_noise(image):
+    """Remove noise from the image using median filtering."""
+    return cv2.medianBlur(image, 3)
+
+# ----------------------- OCR Functions -----------------------
+
+def extract_text(image_path):
+    """Perform OCR to extract text from the image."""
+    if not image_path or not os.path.exists(image_path):
+        print(f"Image path does not exist: {image_path}")
+        return ""
+
     try:
-        placeholder_image = Image.new('RGB', (100, 100), color='black')
-        placeholder_image.save(image_save_path)
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"Error reading image file: {image_path}")
+            return ""
+
+        # Preprocess the image for OCR
+        image = rescale_image(image)
+        image = enhance_contrast(image)
+        image = binarize_image(image)
+        image = remove_noise(image)
+        return pytesseract.image_to_string(image)
     except Exception as e:
-        return
+        print(f"Error extracting text from {image_path}: {e}")
+        return ""
+
+def batch_ocr(image_paths, num_threads=4):
+    """Perform OCR on a batch of images using multiple threads."""
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        ocr_results = list(tqdm(executor.map(extract_text, image_paths), total=len(image_paths)))
+    return ocr_results
+
+# ----------------------- Utility Functions -----------------------
 
 def download_image(image_link, save_folder, retries=3, delay=3):
-    if not isinstance(image_link, str):
-        return
+    """Download image from link and handle failures gracefully."""
+    if not isinstance(image_link, str) or not image_link.startswith("http"):
+        print(f"Invalid URL: {image_link}")
+        return None
 
-    filename = Path(image_link).name
-    image_save_path = os.path.join(save_folder, filename)
+    # Use the filename from the URL to save the image
+    image_save_path = os.path.join(save_folder, Path(image_link).name)
 
+    # If the image already exists locally, skip downloading
     if os.path.exists(image_save_path):
-        return
+        return image_save_path  # Image already exists
 
-    for _ in range(retries):
+    for attempt in range(retries):
         try:
-            urllib.request.urlretrieve(image_link, image_save_path)
-            return
-        except:
+            # Fetch the image content from the URL
+            response = requests.get(image_link, stream=True, timeout=5)
+            if response.status_code == 200:
+                # Open the image from the response content and save it locally
+                image = Image.open(BytesIO(response.content))
+                image.save(image_save_path)
+                return image_save_path
+            else:
+                print(f"Failed to download {image_link}, status code: {response.status_code}")
+        except Exception as e:
+            print(f"Error downloading {image_link}: {e}")
             time.sleep(delay)
-    
-    create_placeholder_image(image_save_path) #Create a black placeholder image for invalid links/images
 
-def download_images(image_links, download_folder, allow_multiprocessing=True):
+    # If the download fails after retries, return None and skip
+    print(f"Failed to download image after {retries} retries: {image_link}")
+    return None
+
+def download_images(image_links, download_folder, use_multiprocessing=True, num_processes=4):
+    """Download images in parallel or sequentially, with improved error handling."""
     if not os.path.exists(download_folder):
         os.makedirs(download_folder)
 
-    if allow_multiprocessing:
-        download_image_partial = partial(
-            download_image, save_folder=download_folder, retries=3, delay=3)
-
-        with multiprocessing.Pool(50) as pool:
-            list(tqdm(pool.imap(download_image_partial, image_links), total=len(image_links)))
+    download_partial = partial(download_image, save_folder=download_folder)
+    
+    if use_multiprocessing:
+        # Use a smaller number of processes to avoid overwhelming the system
+        with multiprocessing.Pool(num_processes) as pool:
+            image_paths = list(tqdm(pool.imap(download_partial, image_links), total=len(image_links)))
             pool.close()
             pool.join()
     else:
+        # Download images sequentially
+        image_paths = []
         for image_link in tqdm(image_links, total=len(image_links)):
-            download_image(image_link, save_folder=download_folder, retries=3, delay=3)
-        
-        
-def main():
-    # creating array
-    df = pd.read_csv('D:/Desktop_Ddrive/aws_ml/dataset/train.csv')
-    
-    # array = df.iloc[:140000]['image_link'].to_numpy()
-    
-    # save_folder = "./images"
-    
-    # # downloading images
-    # download_images(array,save_folder)
-    
-    reader  =  ocr_init(gpu=True)
-    
-    # # extract and parse text from image
-    img_folder = "D:/Desktop_Ddrive/aws_ml/resized_images"
-    ocr_df = ocr_extract_and_parse_text(reader,img_folder, df , limit_rows=140000)
-    
-    # Merge the OCR data with the input DataFrame, using the image_id to match
-    df['parsed_value'], df['parsed_unit'] = zip(*df['image_id'].map(ocr_df.to_dict('index')).apply(lambda x: (x['parsed_value'], x['parsed_unit']) if x else (None, None)))
+            image_path = download_image(image_link, download_folder)
+            image_paths.append(image_path)
 
-    print(df.head())
+    return image_paths
+            
+
+# ----------------------- Data Preprocessing Functions -----------------------
+
+def preprocess_train_data(train_csv, download_folder, sample_size=30000, test_size=0.2, num_threads=4):
+    """Preprocess and sample training data."""
+    train_df = pd.read_csv(train_csv)
+
+    if sample_size < len(train_df):
+        train_sample_df = train_df.sample(n=sample_size, random_state=42)
+    else:
+        train_sample_df = train_df
+
+    # Download images from URLs and perform OCR
+    image_paths = download_images(train_sample_df['image_link'].tolist(), download_folder, num_processes=num_threads)
+    ocr_results = batch_ocr(image_paths, num_threads=num_threads)
+
+    # Process OCR results and store parsed number/unit
+    train_sample_df['parsed_number'], train_sample_df['parsed_unit'] = zip(*[parse_string(text.strip()) for text in ocr_results])
+    train_sample_df.fillna(0, inplace=True)
+    train_sample_df, val_df = train_test_split(train_sample_df, test_size=test_size, random_state=42)
+
+    return train_sample_df, val_df
+
+def preprocess_test_data(test_csv, download_folder, sample_size=500, num_threads=4):
+    """Preprocess test data without augmentation."""
+    test_df = pd.read_csv(test_csv)
+
+    if sample_size < len(test_df):
+        test_df = test_df.sample(n=sample_size, random_state=42)
+
+    # Download images from URLs and perform OCR
+    image_paths = download_images(test_df['image_link'].tolist(), download_folder, num_processes=num_threads)
+    ocr_results = batch_ocr(image_paths, num_threads=num_threads)
+
+    test_df['parsed_number'], test_df['parsed_unit'] = zip(*[parse_string(text.strip()) for text in ocr_results])
+    test_df.fillna(0, inplace=True)
+    return test_df
+
+
+# ----------------------- XGBoost Model Training -----------------------
+
+def train_xgboost_model(train_df, val_df):
+    """Train an XGBoost model using the parsed data."""
+    X_train = train_df[['parsed_number']]
+    y_train = train_df['entity_value']
+    X_val = val_df[['parsed_number']]
+    y_val = val_df['entity_value']
+
+    model = xgb.XGBRegressor(use_label_encoder=False, eval_metric='rmse')
+    model.fit(X_train, y_train)
     
-if __name__ == '__main__':
-    main()
+    y_pred = model.predict(X_val)
+    val_rmse = np.sqrt(np.mean((y_pred - y_val) ** 2))
+    print(f"Validation RMSE: {val_rmse:.4f}")
+    
+    return model
+
+# ----------------------- Main Execution Pipeline -----------------------
+
+
+def main(test_csv, train_csv, save_dir, sample_size=30000, num_threads=4):
+    """Main pipeline to execute the full process."""
+    print("Preprocessing training data...")
+    train_df, val_df = preprocess_train_data(train_csv, download_folder=save_dir, sample_size=sample_size, num_threads=num_threads)
+
+    print("Preprocessing test data...")
+    test_df = preprocess_test_data(test_csv, download_folder=save_dir, num_threads=num_threads)
+
+    print("Training XGBoost model...")
+    model = train_xgboost_model(train_df, val_df)
+
+    print("Making predictions on test data...")
+    X_test = test_df[['parsed_number']]
+    test_df['predictions'] = model.predict(X_test)
+
+    print("Pipeline completed.")
+    return train_df, val_df, test_df
+
+# Run if executed directly
+if __name__ == "__main__":
+    TEST_CSV_PATH = "D:/Desktop_Ddrive/aws_ml/dataset/test.csv"
+    TRAIN_CSV_PATH = "D:/Desktop_Ddrive/aws_ml/dataset/train.csv"
+    SAVE_DIR = "./images"
+    SAMPLE_SIZE = 30000  # Define how many rows to sample from the training dataset
+    
+    # Execute the pipeline
+    train_df, val_df, test_df = main(TEST_CSV_PATH, TRAIN_CSV_PATH, SAVE_DIR, SAMPLE_SIZE)
